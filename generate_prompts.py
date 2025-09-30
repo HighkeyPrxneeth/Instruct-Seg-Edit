@@ -22,7 +22,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Configuration - OPTIMIZED FOR RATE LIMITING AND API TIMEOUTS
 CONFIG = {
-    "api_key": "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",
+    "api_key": "api-key",
     "base_url": "http://127.0.0.1:1234/v1",  # OpenRouter base URL for OpenAI client
     "model": "gemma-3-4b-it",
     "image_size": (512, 512),
