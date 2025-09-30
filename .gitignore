@@ -1,0 +1,6 @@
+.env
+*/
+*.log
+*.pdf
+synopsis.md
+idea.md 
