@@ -1,7 +1,7 @@
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-import tensorflow.keras.backend as K
+from tensorflow.keras import layers # type: ignore
+import tensorflow.keras.backend as K # type: ignore
 from vit_keras import vit
 import os
 import glob
@@ -18,7 +18,7 @@ IMAGE_DIR = "data/sa-1b-000001-images/"
 # Model & Training parameters
 IMAGE_SIZE = (512, 512)
 MASK_SIZE = (256, 256)
-BATCH_SIZE = 256  # Adjust based on your GPU memory
+BATCH_SIZE = 4  # Adjust based on your GPU memory
 NUM_POINTS_PROMPT = 10 # 1 positive, 9 negative
 EPOCHS = 5
 
@@ -207,7 +207,7 @@ if __name__ == "__main__":
     segmentor.fit(
         train_generator,
         epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
+        # batch_size=BATCH_SIZE,
         steps_per_epoch=steps_per_epoch,
         verbose=1
     )
