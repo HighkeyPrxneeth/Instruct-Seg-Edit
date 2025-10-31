@@ -2,3 +2,5 @@ models/**
 data/** 
 __pycache__/
 *.pyc
+*.jpg
+results/** 

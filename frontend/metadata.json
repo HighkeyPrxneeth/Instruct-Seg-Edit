@@ -1,0 +1,5 @@
+{
+  "name": "Brutalist AI Image Editor",
+  "description": "An AI-powered image editing application with a brutalist and minimalist design. Segment objects, refine masks, and generate creative edits using generative AI.",
+  "requestFramePermissions": []
+}

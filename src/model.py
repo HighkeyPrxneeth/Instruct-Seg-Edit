@@ -3,11 +3,8 @@ from ultralytics import FastSAM
 from PIL import Image
 import torch
 import cv2
-from diffusers import (
-    StableDiffusionControlNetInpaintPipeline,
-    ControlNetModel,
-    UniPCMultistepScheduler
-)
+from diffusers import FluxFillPipeline
+from nunchaku import NunchakuFluxTransformer2dModel
 
 class SegmentationModel:
     def __init__(self, model_path: str = 'models/instruct-seg-edit/best.pt', device: str = 'cuda:0'):
@@ -55,89 +52,71 @@ class SegmentationModel:
         return (mask_image,)
 
 class InpaintingModel:
-    def __init__(self, model_name: str = "runwayml/stable-diffusion-inpainting", control_net: str = "lllyasviel/sd-controlnet-canny", torch_dtype: torch.dtype = torch.float16, device: str = "cuda"):
+    def __init__(self, model_name: str = "black-forest-labs/FLUX.1-Fill-dev", torch_dtype: torch.dtype = torch.bfloat16, device: str = "cuda"):
         """
-        Initialize the inpainting model with ControlNet.
+        Initialize the inpainting model with Flux Fill using Nunchaku int4 quantization.
 
         Args:
-            model_name (str): Name of the pre-trained Stable Diffusion inpainting model.
-            control_net (str): Name of the pre-trained ControlNet model.
+            model_name (str): Name of the pre-trained Flux Fill model.
             torch_dtype (torch.dtype): Data type for the model tensors.
             device (str): Device to run the model on ('cuda' for GPU, 'cpu' for CPU).
         """
-        self.control_net = ControlNetModel.from_pretrained(control_net, torch_dtype=torch_dtype, use_safetensors=True, cache_dir="models/controlnet")
-        print("ControlNet model loaded.")
-        self.pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
-            model_name,
-            controlnet=self.control_net,
-            torch_dtype=torch_dtype,
-            use_safetensors=True,
-            variant="fp16",
-            cache_dir="models/stable-diffusion-inpainting"
+        transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+            "models/nunchaku-flux.1-fill-dev/svdq-int4_r32-flux.1-fill-dev.safetensors",
+            local_files_only=True
         )
-        print("Inpainting pipeline initialized.")
-        self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+        print("Nunchaku int4 transformer loaded.")
+        
+        self.pipe = FluxFillPipeline.from_pretrained(
+            model_name,
+            transformer=transformer,
+            torch_dtype=torch_dtype,
+            use_safetensors=True
+        )
+        print("Flux Fill pipeline initialized with Nunchaku int4 optimization.")
         self.pipe.to(device)
-        self.pipe.vae.to(device)
-
-        self.sigma = 0.33
-
-    def _get_canny_edges(self, image_np: np.ndarray):
-        gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        v = np.median(gray_image)
-        lower_threshold = int(max(0, (1.0 - self.sigma) * v))
-        upper_threshold = int(min(255, (1.0 + self.sigma) * v))
-
-        canny_edges = cv2.Canny(gray_image, lower_threshold, upper_threshold)
-        return canny_edges
-    
-    def _callback_intermediate_diffusion_step(self, step: int, timestep: int, latents: torch.FloatTensor):
-        with torch.no_grad():
-            latents_for_decode = 1 / self.pipe.vae.config.scaling_factor * latents 
-            image_tensor = self.pipe.vae.decode(latents_for_decode).sample
-
-        image_step = self.pipe.image_processor.postprocess(image_tensor, output_type='pil')[0]
-        yield image_step
+        self.device = device
 
     def inpaint(self, prompt: str, 
                 image: Image.Image, 
                 mask: Image.Image,
-                num_inference_steps: int = 25, 
+                num_inference_steps: int = 50, 
                 generator: torch.Generator = torch.manual_seed(42), 
-                visualize_steps: bool = False):
+                visualize_steps: bool = False,
+                guidance_scale: float = 30,
+                height: int = 1024,
+                width: int = 1024):
         """
-        Perform inpainting on the input image using the provided mask and control image.
+        Perform inpainting on the input image using the provided mask.
 
         Args:
             prompt (str): Text prompt for inpainting.
             image (PIL.Image): The input image to be inpainted.
             mask (PIL.Image): The mask image indicating areas to be inpainted.
-            control (PIL.Image): The control image for ControlNet.
             num_inference_steps (int): Number of inference steps for the diffusion process.
             generator (torch.Generator): Random generator for reproducibility.
+            visualize_steps (bool): If True, yields intermediate steps during inference.
+            guidance_scale (float): Guidance scale for the diffusion process.
+            height (int): Output image height.
+            width (int): Output image width.
         """
-        image_np = np.array(image)
-        canny_edges = self._get_canny_edges(image_np)
-        control_image = Image.fromarray(canny_edges).convert("RGB")
         print("Processing inpainting...")
         print("Text prompt:", prompt)
 
         if visualize_steps:
+            # For Flux Fill, we'll use a callback for intermediate steps
             def run_generator():
                 edited_image = self.pipe(
                     prompt=prompt,
                     image=image,
                     mask_image=mask,
-                    control_image=control_image,
                     num_inference_steps=num_inference_steps,
                     generator=generator,
-                    output_type="latent",
-                    callback_on_step_end=self._callback_intermediate_diffusion_step,
-                )
-
-                final_image = self.pipe.decode_latents(edited_image.images)
-                final_pil_image = self.pipe.image_processor.postprocess(final_image, output_type='pil')[0]
-                yield final_pil_image
+                    guidance_scale=guidance_scale,
+                    height=height,
+                    width=width,
+                ).images[0]
+                yield edited_image
 
             return run_generator()
     
@@ -146,8 +125,10 @@ class InpaintingModel:
                 prompt=prompt,
                 image=image,
                 mask_image=mask,
-                control_image=control_image,
                 num_inference_steps=num_inference_steps,
-                generator=generator
+                generator=generator,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width,
             ).images[0]
             return edited_image

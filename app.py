@@ -6,11 +6,9 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-import io
 import base64
 import torch
 import time
-import numpy as np
 
 from src.model import SegmentationModel, InpaintingModel
 from src.data_loader import DataLoader
@@ -88,16 +86,9 @@ async def inpaint_image(
     img = Image.open(image.file).convert("RGB")
     mask_img = Image.open(mask.file).convert("L")
 
-    # Ensure mask and image have the same dimensions (use NEAREST to avoid anti-aliasing)
     if img.size != mask_img.size:
-        mask_img = mask_img.resize(img.size, Image.NEAREST)
+        img = img.resize(mask_img.size, Image.NEAREST)
 
-    # Binarize mask to ensure a clean inpaint region: white(255)=edit region, black(0)=keep
-    mask_img = mask_img.point(lambda p: 255 if p > 127 else 0)
-
-    # Invert mask: pipeline expects white (255) to be the area to KEEP and black (0) to be inpainted.
-    # Our mask has white on the object, so we invert it.
-    mask_img = Image.fromarray(255 - np.array(mask_img))
 
     if seed is None:
         seed = int(time.time())
@@ -107,7 +98,9 @@ async def inpaint_image(
         image=img,
         mask=mask_img,
         num_inference_steps=inference_steps,
-        generator=generator
+        generator=generator,
+        height=img.height,
+        width=img.width
     )
 
     inpainted_path = dataloader.save_image(inpainted_img)
