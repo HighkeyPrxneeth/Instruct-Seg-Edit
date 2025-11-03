@@ -1,4 +1,6 @@
-from src.model import SegmentationModel, InpaintingModel
+from src.model import InpaintingModel
+from dotenv import load_dotenv
+load_dotenv()
 
 inpainter = InpaintingModel()
 

@@ -2,8 +2,11 @@ import numpy as np
 from ultralytics import FastSAM
 from PIL import Image
 import torch
+import os
 import cv2
-from diffusers import FluxFillPipeline
+from diffusers import ControlNetModel, FluxFillPipeline, StableDiffusionControlNetInpaintPipeline, UniPCMultistepScheduler
+from diffusers.models.controlnets.controlnet_sd3 import SD3ControlNetModel
+from diffusers.pipelines import StableDiffusion3ControlNetInpaintingPipeline
 from nunchaku import NunchakuFluxTransformer2dModel
 
 class SegmentationModel:
@@ -52,30 +55,152 @@ class SegmentationModel:
         return (mask_image,)
 
 class InpaintingModel:
-    def __init__(self, model_name: str = "black-forest-labs/FLUX.1-Fill-dev", torch_dtype: torch.dtype = torch.bfloat16, device: str = "cuda"):
-        """
-        Initialize the inpainting model with Flux Fill using Nunchaku int4 quantization.
+    """Selectable inpainting backend supporting Flux Fill, SD3, or SD1.5 ControlNet."""
 
-        Args:
-            model_name (str): Name of the pre-trained Flux Fill model.
-            torch_dtype (torch.dtype): Data type for the model tensors.
-            device (str): Device to run the model on ('cuda' for GPU, 'cpu' for CPU).
-        """
+    _DEFAULT_BACKEND = "flux"
+    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15"}
+    _DEFAULT_MODELS = {
+        "flux": "black-forest-labs/FLUX.1-Fill-dev",
+        "sd3": "stabilityai/stable-diffusion-3-medium-diffusers",
+        "sd15": "runwayml/stable-diffusion-inpainting",
+    }
+    _DEFAULT_CONTROLNET = "lllyasviel/sd-controlnet-canny"
+    _SD3_NEGATIVE_PROMPT = (
+        "deformed, distorted, disfigured, poorly drawn, bad anatomy, wrong anatomy, "
+        "extra limb, missing limb, floating limbs, mutated hands and fingers, "
+        "disconnected limbs, mutation, mutated, ugly, disgusting, blurry, amputation, NSFW"
+    )
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        torch_dtype: torch.dtype | None = None,
+        device: str = "cuda",
+        backend: str | None = None,
+        control_net: str | None = None,
+    ):
+        """Initialize the inpainting model with the requested diffusion backend."""
+
+        resolved_backend = (backend or os.environ.get("INPAINT_BACKEND") or self._DEFAULT_BACKEND).lower()
+        if resolved_backend not in self._SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"Unsupported inpainting backend '{resolved_backend}'. Pick one of: {sorted(self._SUPPORTED_BACKENDS)}."
+            )
+
+        self.backend = resolved_backend
+        self.device = device
+        self._sd15_sigma = 0.33
+
+        effective_model = model_name or self._DEFAULT_MODELS[self.backend]
+
+        if self.backend == "flux":
+            self._init_flux(model_name=effective_model, torch_dtype=torch_dtype)
+        elif self.backend == "sd3":
+            self._init_sd3()
+        else:
+            self._init_sd15(model_name=effective_model, torch_dtype=torch_dtype, control_net=control_net)
+
+        print(f"Inpainting backend '{self.backend}' initialized on device '{self.device}'.")
+
+    def _init_flux(self, model_name: str, torch_dtype: torch.dtype | None) -> None:
+        """Load the Flux Fill pipeline with the Nunchaku quantized transformer."""
+
+        dtype = torch_dtype or torch.float16
         transformer = NunchakuFluxTransformer2dModel.from_pretrained(
             "models/nunchaku-flux.1-fill-dev/svdq-int4_r32-flux.1-fill-dev.safetensors",
-            local_files_only=True
+            local_files_only=True,
         )
-        print("Nunchaku int4 transformer loaded.")
-        
+        token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        print("Transformer model loaded for Nunchaku int4 optimization.")
+
         self.pipe = FluxFillPipeline.from_pretrained(
             model_name,
             transformer=transformer,
-            torch_dtype=torch_dtype,
-            use_safetensors=True
+            use_safetensors=True,
+            torch_dtype=dtype,
         )
+
+        # # Reduce VRAM pressure by slicing attention and keeping text encoder on CPU.
+        # self.pipe.enable_attention_slicing()
+        # # If accelerate is installed / supported, enable CPU offload to greatly reduce VRAM peak.
+        # if hasattr(self.pipe, "enable_model_cpu_offload"):
+        #     try:
+        #         self.pipe.enable_model_cpu_offload()
+        #         print("Enabled model CPU offload to reduce VRAM usage.")
+        #     except Exception as e:
+        #         print("Model CPU offload available but failed to enable:", e)
+        # if self.device.startswith("cuda"):
+        #     self.pipe.unet.to(self.device)
+        #     if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
+        #         self.pipe.vae.to(self.device)
+        #     # Set execution device to keep scheduler latents on the GPU.
+        #     self.pipe._execution_device = torch.device(self.device)
+        # else:
         print("Flux Fill pipeline initialized with Nunchaku int4 optimization.")
-        self.pipe.to(device)
-        self.device = device
+        self.pipe.to(self.device)
+
+    def _init_sd3(self) -> None:
+        """Load the Stable Diffusion 3 ControlNet inpainting pipeline."""
+
+        dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
+        controlnet = SD3ControlNetModel.from_pretrained(
+            "alimama-creative/SD3-Controlnet-Inpainting",
+            use_safetensors=True,
+            extra_conditioning_channels=1,
+            torch_dtype=dtype,
+            cache_dir="models/sd3-controlnet-inpainting",
+        )
+        self.pipe = StableDiffusion3ControlNetInpaintingPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-3-medium-diffusers",
+            controlnet=controlnet,
+            torch_dtype=dtype,
+            cache_dir="models/sd3-controlnet-inpainting",
+        )
+
+        if self.device.startswith("cuda"):
+            self.pipe.text_encoder.to(dtype)
+            self.pipe.controlnet.to(dtype)
+        self.pipe.to(self.device)
+
+    def _init_sd15(self, model_name: str, torch_dtype: torch.dtype | None, control_net: str | None) -> None:
+        """Load the Stable Diffusion 1.5 ControlNet inpainting pipeline."""
+
+        dtype = torch_dtype or (torch.float16 if self.device.startswith("cuda") else torch.float32)
+        control_model_id = control_net or self._DEFAULT_CONTROLNET
+        self.control_net = ControlNetModel.from_pretrained(
+            control_model_id,
+            torch_dtype=dtype,
+            use_safetensors=True,
+            cache_dir="models/controlnet",
+        )
+        pipe_kwargs = {
+            "controlnet": self.control_net,
+            "torch_dtype": dtype,
+            "use_safetensors": True,
+            "cache_dir": "models/stable-diffusion-inpainting",
+        }
+        if dtype == torch.float16:
+            pipe_kwargs["variant"] = "fp16"
+        self.pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+            model_name,
+            **pipe_kwargs,
+        )
+        self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.to(self.device)
+        if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
+            self.pipe.vae.to(self.device)
+
+    def _sd15_get_canny_edges(self, image_np: np.ndarray) -> np.ndarray:
+        gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        v = np.median(gray_image)
+        lower_threshold = int(max(0, (1.0 - self._sd15_sigma) * v))
+        upper_threshold = int(min(255, (1.0 + self._sd15_sigma) * v))
+        return cv2.Canny(gray_image, lower_threshold, upper_threshold)
+
+    def _sd15_control_image(self, image: Image.Image) -> Image.Image:
+        image_np = np.array(image.convert("RGB"))
+        canny_edges = self._sd15_get_canny_edges(image_np)
+        return Image.fromarray(canny_edges).convert("RGB")
 
     def inpaint(self, prompt: str, 
                 image: Image.Image, 
@@ -85,7 +210,9 @@ class InpaintingModel:
                 visualize_steps: bool = False,
                 guidance_scale: float = 30,
                 height: int = 1024,
-                width: int = 1024):
+                width: int = 1024,
+                negative_prompt: str | None = None,
+                controlnet_conditioning_scale: float | None = None):
         """
         Perform inpainting on the input image using the provided mask.
 
@@ -103,24 +230,24 @@ class InpaintingModel:
         print("Processing inpainting...")
         print("Text prompt:", prompt)
 
-        if visualize_steps:
-            # For Flux Fill, we'll use a callback for intermediate steps
-            def run_generator():
-                edited_image = self.pipe(
-                    prompt=prompt,
-                    image=image,
-                    mask_image=mask,
-                    num_inference_steps=num_inference_steps,
-                    generator=generator,
-                    guidance_scale=guidance_scale,
-                    height=height,
-                    width=width,
-                ).images[0]
-                yield edited_image
+        if self.backend == "flux":
+            if visualize_steps:
+                # For Flux Fill, use a generator to stream intermediate results.
+                def run_generator():
+                    edited_image = self.pipe(
+                        prompt=prompt,
+                        image=image,
+                        mask_image=mask,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                        guidance_scale=guidance_scale,
+                        height=height,
+                        width=width,
+                    ).images[0]
+                    yield edited_image
 
-            return run_generator()
-    
-        else:
+                return run_generator()
+
             edited_image = self.pipe(
                 prompt=prompt,
                 image=image,
@@ -132,3 +259,46 @@ class InpaintingModel:
                 width=width,
             ).images[0]
             return edited_image
+
+        if self.backend == "sd15":
+            control_image = self._sd15_control_image(image)
+            if visualize_steps:
+                def run_generator():
+                    edited_image = self.pipe(
+                        prompt=prompt,
+                        image=image,
+                        mask_image=mask,
+                        control_image=control_image,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                    ).images[0]
+                    yield edited_image
+
+                return run_generator()
+
+            edited_image = self.pipe(
+                prompt=prompt,
+                image=image,
+                mask_image=mask,
+                control_image=control_image,
+                num_inference_steps=num_inference_steps,
+                generator=generator,
+            ).images[0]
+            return edited_image
+
+        # SD3 backend only supports returning the final frame.
+        scale = controlnet_conditioning_scale if controlnet_conditioning_scale is not None else 0.95
+        neg_prompt = negative_prompt if negative_prompt is not None else self._SD3_NEGATIVE_PROMPT
+        edited_image = self.pipe(
+            prompt=prompt,
+            negative_prompt=neg_prompt,
+            height=height,
+            width=width,
+            control_image=image,
+            control_mask=mask.convert("RGB"),
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            controlnet_conditioning_scale=scale,
+            guidance_scale=guidance_scale,
+        ).images[0]
+        return edited_image

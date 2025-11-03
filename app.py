@@ -9,15 +9,13 @@ from PIL import Image
 import base64
 import torch
 import time
+import os
+from dotenv import load_dotenv
 
 from src.model import SegmentationModel, InpaintingModel
 from src.data_loader import DataLoader
 
-segmentor = SegmentationModel()
-inpainter = InpaintingModel()
-
-dataloader = DataLoader()
-
+load_dotenv()
 app = FastAPI()
 
 app.add_middleware(
@@ -27,6 +25,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup():
+    global segmentor
+    global inpainter
+    global dataloader
+    print("Loading models...")
+    segmentor = SegmentationModel()
+    backend = os.environ.get("INPAINT_BACKEND")
+    if backend:
+        print(f"Requested inpainting backend via INPAINT_BACKEND={backend}")
+    inpainter = InpaintingModel(backend=backend)
+    dataloader = DataLoader()
+    print("Models loaded successfully.")
+
 
 @app.get("/api/health")
 async def health_check():
