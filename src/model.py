@@ -4,7 +4,13 @@ from PIL import Image
 import torch
 import os
 import cv2
-from diffusers import ControlNetModel, FluxFillPipeline, StableDiffusionControlNetInpaintPipeline, UniPCMultistepScheduler
+from diffusers import (
+    ControlNetModel, 
+    FluxFillPipeline, 
+    StableDiffusionControlNetInpaintPipeline, 
+    UniPCMultistepScheduler,
+    StableDiffusionInpaintPipeline,
+)
 from diffusers.models.controlnets.controlnet_sd3 import SD3ControlNetModel
 from diffusers.pipelines import StableDiffusion3ControlNetInpaintingPipeline
 from nunchaku import NunchakuFluxTransformer2dModel
@@ -58,11 +64,12 @@ class InpaintingModel:
     """Selectable inpainting backend supporting Flux Fill, SD3, or SD1.5 ControlNet."""
 
     _DEFAULT_BACKEND = "flux"
-    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15"}
+    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15", "sd2"}
     _DEFAULT_MODELS = {
         "flux": "black-forest-labs/FLUX.1-Fill-dev",
         "sd3": "stabilityai/stable-diffusion-3-medium-diffusers",
         "sd15": "runwayml/stable-diffusion-inpainting",
+        "sd2": "stabilityai/stable-diffusion-2-inpainting",
     }
     _DEFAULT_CONTROLNET = "lllyasviel/sd-controlnet-canny"
     _SD3_NEGATIVE_PROMPT = (
@@ -97,6 +104,8 @@ class InpaintingModel:
             self._init_flux(model_name=effective_model, torch_dtype=torch_dtype)
         elif self.backend == "sd3":
             self._init_sd3()
+        elif self.backend == "sd2":
+            self._init_sd2()
         else:
             self._init_sd15(model_name=effective_model, torch_dtype=torch_dtype, control_net=control_net)
 
@@ -118,6 +127,7 @@ class InpaintingModel:
             transformer=transformer,
             use_safetensors=True,
             torch_dtype=dtype,
+            cache_dir="models/flux-fill",
         )
 
         # # Reduce VRAM pressure by slicing attention and keeping text encoder on CPU.
@@ -189,6 +199,18 @@ class InpaintingModel:
         self.pipe.to(self.device)
         if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
             self.pipe.vae.to(self.device)
+    
+    def _init_sd2(self) -> None:
+        """Load the Stable Diffusion 2 inpainting pipeline."""
+        self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-2-inpainting",
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+            cache_dir="models/stable-diffusion-2-inpainting",
+        )
+
+        self.pipe.to(self.device)
 
     def _sd15_get_canny_edges(self, image_np: np.ndarray) -> np.ndarray:
         gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
@@ -232,7 +254,6 @@ class InpaintingModel:
 
         if self.backend == "flux":
             if visualize_steps:
-                # For Flux Fill, use a generator to stream intermediate results.
                 def run_generator():
                     edited_image = self.pipe(
                         prompt=prompt,
@@ -286,7 +307,29 @@ class InpaintingModel:
             ).images[0]
             return edited_image
 
-        # SD3 backend only supports returning the final frame.
+        if self.backend == "sd2":
+            if visualize_steps:
+                def run_generator():
+                    edited_image = self.pipe(
+                        prompt=prompt,
+                        image=image,
+                        mask_image=mask,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                    ).images[0]
+                    yield edited_image
+
+                return run_generator()
+            
+            edited_image = self.pipe(
+                prompt=prompt,
+                image=image,
+                mask_image=mask,
+                num_inference_steps=num_inference_steps,
+                generator=generator,
+            ).images[0]
+            return edited_image
+
         scale = controlnet_conditioning_scale if controlnet_conditioning_scale is not None else 0.95
         neg_prompt = negative_prompt if negative_prompt is not None else self._SD3_NEGATIVE_PROMPT
         edited_image = self.pipe(
