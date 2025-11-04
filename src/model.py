@@ -17,7 +17,7 @@ from diffusers.pipelines import StableDiffusion3ControlNetInpaintingPipeline
 from nunchaku import NunchakuFluxTransformer2dModel
 from openai import OpenAI
 
-from data_loader import DataLoader
+from src.data_loader import DataLoader
 
 class SegmentationModel:
     def __init__(self, model_path: str = 'models/instruct-seg-edit/best.pt', device: str = 'cuda:0'):
@@ -68,13 +68,14 @@ class InpaintingModel:
     """Selectable inpainting backend supporting Flux Fill, SD3, or SD1.5 ControlNet."""
 
     _DEFAULT_BACKEND = "flux"
-    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15", "sd2", "sdxl"}
+    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15", "sd2", "sdxl", "api"}
     _DEFAULT_MODELS = {
         "flux": "black-forest-labs/FLUX.1-Fill-dev",
         "sd3": "stabilityai/stable-diffusion-3-medium-diffusers",
         "sd15": "runwayml/stable-diffusion-inpainting",
         "sd2": "stabilityai/stable-diffusion-2-inpainting",
         "sdxl": "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+        "api": "recraft"
     }
     _DEFAULT_CONTROLNET = "lllyasviel/sd-controlnet-canny"
     _SD3_NEGATIVE_PROMPT = (
@@ -114,6 +115,8 @@ class InpaintingModel:
             self._init_sd2()
         elif self.backend == "sdxl":
             self._init_sdxl(model_name=effective_model, torch_dtype=torch_dtype)
+        elif self.backend == "api":
+            self._init_api()
         else:
             self._init_sd15(model_name=effective_model, torch_dtype=torch_dtype, control_net=control_net)
 
