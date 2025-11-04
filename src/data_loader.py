@@ -63,6 +63,20 @@ class DataLoader:
             save_path = self.save_image(pil_image)
             return self.to_pil(save_path)
         
+    def load_image_from_url(self, url: str) -> Image.Image:
+        """
+        Load an image from a URL and convert it to a PIL Image.
+
+        Args:
+            url (str): The URL of the image.
+        Returns:
+            Image.Image: The loaded PIL Image.
+        """
+        import requests
+        response = requests.get(url)
+        image = Image.open(io.BytesIO(response.content)).convert("RGB")
+        return image
+        
     def convert_to_blob(self, image: Image.Image, format: str = "PNG") -> bytes:
         """
         Convert a PIL Image to a binary blob.

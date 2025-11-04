@@ -5,6 +5,7 @@ import torch
 import os
 import cv2
 from diffusers import (
+    AutoPipelineForInpainting,
     ControlNetModel, 
     FluxFillPipeline, 
     StableDiffusionControlNetInpaintPipeline, 
@@ -14,6 +15,9 @@ from diffusers import (
 from diffusers.models.controlnets.controlnet_sd3 import SD3ControlNetModel
 from diffusers.pipelines import StableDiffusion3ControlNetInpaintingPipeline
 from nunchaku import NunchakuFluxTransformer2dModel
+from openai import OpenAI
+
+from data_loader import DataLoader
 
 class SegmentationModel:
     def __init__(self, model_path: str = 'models/instruct-seg-edit/best.pt', device: str = 'cuda:0'):
@@ -64,12 +68,13 @@ class InpaintingModel:
     """Selectable inpainting backend supporting Flux Fill, SD3, or SD1.5 ControlNet."""
 
     _DEFAULT_BACKEND = "flux"
-    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15", "sd2"}
+    _SUPPORTED_BACKENDS = {"flux", "sd3", "sd15", "sd2", "sdxl"}
     _DEFAULT_MODELS = {
         "flux": "black-forest-labs/FLUX.1-Fill-dev",
         "sd3": "stabilityai/stable-diffusion-3-medium-diffusers",
         "sd15": "runwayml/stable-diffusion-inpainting",
         "sd2": "stabilityai/stable-diffusion-2-inpainting",
+        "sdxl": "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
     }
     _DEFAULT_CONTROLNET = "lllyasviel/sd-controlnet-canny"
     _SD3_NEGATIVE_PROMPT = (
@@ -97,6 +102,7 @@ class InpaintingModel:
         self.backend = resolved_backend
         self.device = device
         self._sd15_sigma = 0.33
+        self.dataloader = DataLoader()
 
         effective_model = model_name or self._DEFAULT_MODELS[self.backend]
 
@@ -106,6 +112,8 @@ class InpaintingModel:
             self._init_sd3()
         elif self.backend == "sd2":
             self._init_sd2()
+        elif self.backend == "sdxl":
+            self._init_sdxl(model_name=effective_model, torch_dtype=torch_dtype)
         else:
             self._init_sd15(model_name=effective_model, torch_dtype=torch_dtype, control_net=control_net)
 
@@ -127,18 +135,19 @@ class InpaintingModel:
             transformer=transformer,
             use_safetensors=True,
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
             cache_dir="models/flux-fill",
         )
 
         # # Reduce VRAM pressure by slicing attention and keeping text encoder on CPU.
-        # self.pipe.enable_attention_slicing()
-        # # If accelerate is installed / supported, enable CPU offload to greatly reduce VRAM peak.
-        # if hasattr(self.pipe, "enable_model_cpu_offload"):
-        #     try:
-        #         self.pipe.enable_model_cpu_offload()
-        #         print("Enabled model CPU offload to reduce VRAM usage.")
-        #     except Exception as e:
-        #         print("Model CPU offload available but failed to enable:", e)
+        self.pipe.enable_attention_slicing()
+        # If accelerate is installed / supported, enable CPU offload to greatly reduce VRAM peak.
+        if hasattr(self.pipe, "enable_model_cpu_offload"):
+            try:
+                self.pipe.enable_model_cpu_offload()
+                print("Enabled model CPU offload to reduce VRAM usage.")
+            except Exception as e:
+                print("Model CPU offload available but failed to enable:", e)
         # if self.device.startswith("cuda"):
         #     self.pipe.unet.to(self.device)
         #     if hasattr(self.pipe, "vae") and self.pipe.vae is not None:
@@ -212,6 +221,30 @@ class InpaintingModel:
 
         self.pipe.to(self.device)
 
+    def _init_sdxl(self, model_name: str, torch_dtype: torch.dtype | None) -> None:
+        """Load the Stable Diffusion XL inpainting pipeline."""
+
+        dtype = torch_dtype or (torch.float16 if self.device.startswith("cuda") else torch.float32)
+        pipe_kwargs: dict[str, object] = {
+            "torch_dtype": dtype,
+            "cache_dir": "models/stable-diffusion-xl-inpainting",
+        }
+        if dtype == torch.float16:
+            pipe_kwargs["variant"] = "fp16"
+
+        self.pipe = AutoPipelineForInpainting.from_pretrained(
+            model_name,
+            **pipe_kwargs,
+        )
+        self.pipe.to(self.device)
+
+    def _init_api(self) -> None:
+        client = OpenAI(
+            base_url='https://external.api.recraft.ai/v1',
+            api_key=os.environ["RECRAFT_API_KEY"],
+        )
+        self.client = client
+
     def _sd15_get_canny_edges(self, image_np: np.ndarray) -> np.ndarray:
         gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         v = np.median(gray_image)
@@ -234,7 +267,8 @@ class InpaintingModel:
                 height: int = 1024,
                 width: int = 1024,
                 negative_prompt: str | None = None,
-                controlnet_conditioning_scale: float | None = None):
+                controlnet_conditioning_scale: float | None = None,
+                strength: float | None = None):
         """
         Perform inpainting on the input image using the provided mask.
 
@@ -280,6 +314,30 @@ class InpaintingModel:
                 width=width,
             ).images[0]
             return edited_image
+
+        if self.backend == "sdxl":
+            def run_pipe() -> Image.Image:
+                pipe_kwargs = {
+                    "prompt": prompt,
+                    "image": image,
+                    "mask_image": mask,
+                    "num_inference_steps": num_inference_steps,
+                    "generator": generator,
+                    "guidance_scale": guidance_scale,
+                    "height": height,
+                    "width": width,
+                }
+                if strength is not None:
+                    pipe_kwargs["strength"] = strength
+                return self.pipe(**pipe_kwargs).images[0]
+
+            if visualize_steps:
+                def run_generator():
+                    yield run_pipe()
+
+                return run_generator()
+
+            return run_pipe()
 
         if self.backend == "sd15":
             control_image = self._sd15_control_image(image)
@@ -328,6 +386,23 @@ class InpaintingModel:
                 num_inference_steps=num_inference_steps,
                 generator=generator,
             ).images[0]
+            return edited_image
+        
+        if self.backend == "api":
+            response = self.client.post(
+                path="/images/inpaint",
+                cast_to=object,
+                options={'headers': {'Content-Type': 'multipart/form-data'}},
+                files={
+                    'image': open(self.dataloader.save_image(image), 'rb'),
+                    'mask': open(self.dataloader.save_image(mask), 'rb'),
+                },
+                body={
+                    'prompt': prompt,
+                },
+            )
+            url = response['data'][0]['url']
+            edited_image = self.dataloader.load_image_from_url(url)
             return edited_image
 
         scale = controlnet_conditioning_scale if controlnet_conditioning_scale is not None else 0.95
